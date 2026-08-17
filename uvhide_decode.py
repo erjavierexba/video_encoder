@@ -535,7 +535,7 @@ def decode_video(
             "-map", "0:v:0",
             "-f", "rawvideo",
             "-pix_fmt", "rgb24",
-            "-vsync", "0",
+            "-fps_mode", "passthrough",
             "pipe:1",
         ],
         stdout=subprocess.PIPE,
