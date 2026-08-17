@@ -52,6 +52,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import wave
 from collections import Counter
 from dataclasses import dataclass
@@ -781,43 +782,87 @@ def launch_player(video_path: Path, result: DecodeResult) -> int:
     # aunque la GPU no tenga las capacidades necesarias. El vídeo que maneja
     # UVHide no necesita aceleración hardware y la decodificación por software
     # evita esos avisos y los fallos de inicialización asociados.
-    os.environ.setdefault(
-        "QT_FFMPEG_DECODING_HW_DEVICE_TYPES",
-        "",
-    )
+    os.environ["QT_FFMPEG_DECODING_HW_DEVICE_TYPES"] = ""
+
+    def install_multimedia_stderr_filter():
+        """
+        Qt 6 puede pedir primero el formato CUDA al decoder software y FFmpeg
+        escribe avisos engañosos antes de continuar correctamente por CPU.
+        Filtramos solo esas líneas conocidas y conservamos el resto de stderr.
+        """
+        if os.name != "posix":
+            return lambda: None
+
+        ignored = (
+            b"No HW decoder found",
+            b"Invalid setup for format cuda",
+            b"Hardware is lacking required capabilities",
+            b"Failed setup for format cuda",
+        )
+
+        try:
+            sys.stderr.flush()
+            saved_stderr = os.dup(2)
+            read_fd, write_fd = os.pipe()
+            os.dup2(write_fd, 2)
+            os.close(write_fd)
+        except OSError:
+            return lambda: None
+
+        def relay() -> None:
+            try:
+                with os.fdopen(read_fd, "rb", buffering=0) as stream:
+                    for line in stream:
+                        if any(pattern in line for pattern in ignored):
+                            continue
+                        os.write(saved_stderr, line)
+            except OSError:
+                pass
+
+        relay_thread = threading.Thread(
+            target=relay,
+            name="uvhide-stderr-filter",
+            daemon=True,
+        )
+        relay_thread.start()
+
+        def restore() -> None:
+            try:
+                sys.stderr.flush()
+                os.dup2(saved_stderr, 2)
+                relay_thread.join(timeout=1.0)
+                os.close(saved_stderr)
+            except OSError:
+                pass
+
+        return restore
 
     try:
         from PySide6.QtCore import (
-            QEvent,
-            QObject,
-            QPoint,
             QRect,
             QTimer,
             Qt,
             QUrl,
-            Signal,
         )
         from PySide6.QtGui import (
             QColor,
             QFont,
             QFontMetrics,
-            QPalette,
+            QImage,
+            QPainter,
         )
         from PySide6.QtMultimedia import (
             QAudioOutput,
             QMediaPlayer,
             QSoundEffect,
+            QVideoSink,
         )
-        from PySide6.QtMultimediaWidgets import QVideoWidget
         from PySide6.QtWidgets import (
             QApplication,
-            QFrame,
             QHBoxLayout,
             QLabel,
             QMainWindow,
             QPushButton,
-            QSizePolicy,
-            QStackedLayout,
             QVBoxLayout,
             QWidget,
         )
@@ -915,34 +960,48 @@ def launch_player(video_path: Path, result: DecodeResult) -> int:
     class VideoOverlay(QWidget):
         def __init__(self):
             super().__init__()
-
-            self.video = QVideoWidget(self)
-
-            self.overlay = QWidget(self)
-            self.overlay.setAttribute(
-                Qt.WidgetAttribute.WA_TransparentForMouseEvents,
+            self.setAttribute(
+                Qt.WidgetAttribute.WA_OpaquePaintEvent,
                 True,
             )
-            self.overlay.setAttribute(
-                Qt.WidgetAttribute.WA_TranslucentBackground,
-                True,
-            )
-            self.overlay.setStyleSheet("background: transparent;")
+            self._image = QImage()
 
-            self.subtitle = SubtitleLabel(self.overlay)
+            # Pintamos nosotros mismos los frames recibidos de QMediaPlayer.
+            # Así el vídeo y el QLabel comparten el mismo QWidget y ninguna
+            # superficie nativa puede tapar los subtítulos en Linux.
+            self.video_sink = QVideoSink(self)
+            self.video_sink.videoFrameChanged.connect(
+                self._video_frame_changed
+            )
+
+            self.subtitle = SubtitleLabel(self)
             self.subtitle.hide()
 
-            stack = QStackedLayout(self)
-            stack.setStackingMode(
-                QStackedLayout.StackingMode.StackAll
-            )
-            stack.setContentsMargins(0, 0, 0, 0)
-            stack.addWidget(self.video)
-            stack.addWidget(self.overlay)
-            # En StackAll el widget actual es el que queda elevado. Sin esto,
-            # QVideoWidget puede pintar por encima del overlay en Linux.
-            stack.setCurrentWidget(self.overlay)
-            self.overlay.raise_()
+        def _video_frame_changed(self, frame) -> None:
+            image = frame.toImage()
+            if not image.isNull():
+                self._image = image
+                self.update()
+
+        def paintEvent(self, event):
+            painter = QPainter(self)
+            painter.fillRect(self.rect(), QColor(0, 0, 0))
+
+            if not self._image.isNull():
+                image_size = self._image.size()
+                image_size.scale(
+                    self.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                )
+                target = QRect(
+                    (self.width() - image_size.width()) // 2,
+                    (self.height() - image_size.height()) // 2,
+                    image_size.width(),
+                    image_size.height(),
+                )
+                painter.drawImage(target, self._image)
+
+            painter.end()
 
         def resizeEvent(self, event):
             super().resizeEvent(event)
@@ -968,7 +1027,6 @@ def launch_player(video_path: Path, result: DecodeResult) -> int:
                 self._layout_subtitle()
                 self.subtitle.show()
                 self.subtitle.set_subtitle_text(text)
-                self.overlay.raise_()
                 self.subtitle.raise_()
                 self.subtitle.update()
             else:
@@ -999,7 +1057,7 @@ def launch_player(video_path: Path, result: DecodeResult) -> int:
             self.audio.setVolume(1.0)
 
             self.video_overlay = VideoOverlay()
-            self.player.setVideoOutput(self.video_overlay.video)
+            self.player.setVideoSink(self.video_overlay.video_sink)
 
             self.chime_tmp = Path(
                 tempfile.gettempdir()
@@ -1253,10 +1311,14 @@ def launch_player(video_path: Path, result: DecodeResult) -> int:
     if app is None:
         app = QApplication(sys.argv)
 
-    window = MainWindow()
-    window.show()
+    restore_stderr = install_multimedia_stderr_filter()
 
-    return app.exec() if owns_app else 0
+    try:
+        window = MainWindow()
+        window.show()
+        return app.exec() if owns_app else 0
+    finally:
+        restore_stderr()
 
 
 def build_parser() -> argparse.ArgumentParser:
