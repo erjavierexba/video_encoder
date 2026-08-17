@@ -777,6 +777,15 @@ def create_chime_wav(path: Path) -> None:
 
 
 def launch_player(video_path: Path, result: DecodeResult) -> int:
+    # El backend FFmpeg de Qt prueba CUDA automáticamente en algunos equipos
+    # aunque la GPU no tenga las capacidades necesarias. El vídeo que maneja
+    # UVHide no necesita aceleración hardware y la decodificación por software
+    # evita esos avisos y los fallos de inicialización asociados.
+    os.environ.setdefault(
+        "QT_FFMPEG_DECODING_HW_DEVICE_TYPES",
+        "",
+    )
+
     try:
         from PySide6.QtCore import (
             QEvent,
@@ -828,6 +837,7 @@ def launch_player(video_path: Path, result: DecodeResult) -> int:
 
         def __init__(self, parent=None):
             super().__init__(parent)
+            self.setObjectName("uvhideSubtitle")
             self.setAlignment(
                 Qt.AlignmentFlag.AlignHCenter
                 | Qt.AlignmentFlag.AlignVCenter
@@ -836,9 +846,9 @@ def launch_player(video_path: Path, result: DecodeResult) -> int:
             self.setTextFormat(Qt.TextFormat.PlainText)
             self.setStyleSheet(
                 """
-                QLabel {
+                QLabel#uvhideSubtitle {
                     color: white;
-                    background: rgba(0, 0, 0, 150);
+                    background-color: rgba(0, 0, 0, 128);
                     border-radius: 10px;
                     padding: 8px 16px;
                 }
@@ -913,6 +923,10 @@ def launch_player(video_path: Path, result: DecodeResult) -> int:
                 Qt.WidgetAttribute.WA_TransparentForMouseEvents,
                 True,
             )
+            self.overlay.setAttribute(
+                Qt.WidgetAttribute.WA_TranslucentBackground,
+                True,
+            )
             self.overlay.setStyleSheet("background: transparent;")
 
             self.subtitle = SubtitleLabel(self.overlay)
@@ -925,6 +939,10 @@ def launch_player(video_path: Path, result: DecodeResult) -> int:
             stack.setContentsMargins(0, 0, 0, 0)
             stack.addWidget(self.video)
             stack.addWidget(self.overlay)
+            # En StackAll el widget actual es el que queda elevado. Sin esto,
+            # QVideoWidget puede pintar por encima del overlay en Linux.
+            stack.setCurrentWidget(self.overlay)
+            self.overlay.raise_()
 
         def resizeEvent(self, event):
             super().resizeEvent(event)
@@ -947,8 +965,12 @@ def launch_player(video_path: Path, result: DecodeResult) -> int:
 
         def set_text(self, text: str):
             if text:
+                self._layout_subtitle()
                 self.subtitle.show()
                 self.subtitle.set_subtitle_text(text)
+                self.overlay.raise_()
+                self.subtitle.raise_()
+                self.subtitle.update()
             else:
                 self.subtitle.hide()
                 self.subtitle.setText("")
