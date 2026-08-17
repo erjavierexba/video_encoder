@@ -1,11 +1,13 @@
-name: Build Windows EXE
+name: Build and release Windows executables
 
 on:
   workflow_dispatch:
   push:
-    paths:
-      - "uvhide_encode_5x.py"
-      - ".github/workflows/build-windows.yml"
+    tags:
+      - "*ALPHA*"
+
+permissions:
+  contents: write
 
 jobs:
   build-windows:
@@ -24,7 +26,7 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          python -m pip install numpy pyinstaller
+          python -m pip install numpy PySide6 pyinstaller
 
       - name: Download static FFmpeg for Windows
         shell: pwsh
@@ -42,7 +44,7 @@ jobs:
           Copy-Item $ffmpeg.FullName .\ffmpeg.exe
           Copy-Item $ffprobe.FullName .\ffprobe.exe
 
-      - name: Build uvhide-encoder.exe
+      - name: Build encoder and decoder
         shell: pwsh
         run: |
           pyinstaller `
@@ -55,10 +57,21 @@ jobs:
             --add-binary "ffprobe.exe;." `
             uvhide_encode_5x.py
 
-      - name: Smoke test
+          pyinstaller `
+            --noconfirm `
+            --clean `
+            --onefile `
+            --console `
+            --name uvhide-decoder `
+            --add-binary "ffmpeg.exe;." `
+            --add-binary "ffprobe.exe;." `
+            uvhide_decode.py
+
+      - name: End-to-end smoke test
         shell: pwsh
         run: |
           .\dist\uvhide-encoder.exe --help
+          .\dist\uvhide-decoder.exe --help
 
           .\ffmpeg.exe `
             -y `
@@ -73,16 +86,25 @@ jobs:
             "HOLA" `
             -o test_encoded.mp4
 
-          if (-not (Test-Path .\test_encoded.mp4)) {
-            throw "El encoder no generó el MP4 de prueba."
+          $decoded = .\dist\uvhide-decoder.exe test_encoded.mp4 --text
+          if ($decoded.Trim() -ne "HOLA") {
+            throw "El decoder devolvió '$decoded' en vez de 'HOLA'."
           }
 
-          if ((Get-Item .\test_encoded.mp4).Length -le 0) {
-            throw "El MP4 de prueba está vacío."
-          }
-
-      - name: Upload EXE
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: uvhide-encoder-windows-x64
-          path: dist/uvhide-encoder.exe
+          name: uvhide-windows-x64
+          path: |
+            dist/uvhide-encoder.exe
+            dist/uvhide-decoder.exe
+
+      - name: Create GitHub prerelease
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          generate_release_notes: true
+          files: |
+            dist/uvhide-encoder.exe
+            dist/uvhide-decoder.exe
