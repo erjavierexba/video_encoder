@@ -86,8 +86,16 @@ jobs:
             "HOLA" `
             -o test_encoded.mp4
 
-          $decoded = .\dist\uvhide-decoder.exe test_encoded.mp4 --text
-          if ($decoded.Trim() -ne "HOLA") {
+          $decodedOutput = & .\dist\uvhide-decoder.exe test_encoded.mp4 --text 2>&1
+          $decoderExitCode = $LASTEXITCODE
+          $decodedOutput | ForEach-Object { Write-Host $_ }
+
+          if ($decoderExitCode -ne 0) {
+            throw "El decoder terminó con el código $decoderExitCode."
+          }
+
+          $decoded = ($decodedOutput | Select-Object -Last 1).ToString().Trim()
+          if ($decoded -ne "HOLA") {
             throw "El decoder devolvió '$decoded' en vez de 'HOLA'."
           }
 
